@@ -1,0 +1,6 @@
+config.sh
+state.json
+reviewer.log
+last_checked
+launchd_stdout.log
+launchd_stderr.log

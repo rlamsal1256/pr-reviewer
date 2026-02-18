@@ -1,0 +1,132 @@
+#!/usr/bin/env bash
+set -eo pipefail
+
+REVIEWS_DIR="$HOME/.pr-reviews"
+LAST_CHECKED_FILE="$HOME/.config/pr-reviewer/last_checked"
+LOG_FILE="$HOME/.config/pr-reviewer/reviewer.log"
+
+usage() {
+    echo "Usage: pr-reviews [command]"
+    echo ""
+    echo "Commands:"
+    echo "  new       Show reviews since you last checked (default)"
+    echo "  all       Show all reviews from today"
+    echo "  pr NUM    Show the latest review for a specific PR"
+    echo "  log       Tail the reviewer log"
+    echo "  status    Show reviewer job status"
+    echo ""
+}
+
+RED='\033[31m'
+GREEN='\033[32m'
+YELLOW='\033[33m'
+RESET='\033[0m'
+
+format_review_line() {
+    local file="$1"
+    local pr_num
+    pr_num=$(basename "$(dirname "$file")")
+
+    local verdict title size author
+    verdict=$(grep -m1 '^\- \*\*Verdict:\*\*' "$file" 2>/dev/null | sed 's/.*\*\* //' || true)
+    if [[ -z "$verdict" ]]; then
+        verdict=$(grep -oiE '(APPROVE|REQUEST_CHANGES|COMMENT)' "$file" | head -1 || true)
+    fi
+    verdict="${verdict:-UNKNOWN}"
+    title=$(grep -m1 '^# Review:' "$file" 2>/dev/null | sed 's/# Review: //' || true)
+    size=$(grep -m1 '^\- \*\*Size:\*\*' "$file" 2>/dev/null | sed 's/.*\*\* //' || true)
+    author=$(grep -m1 '^\- \*\*Author:\*\*' "$file" 2>/dev/null | sed 's/.*\*\* //' || true)
+
+    local color="$RESET"
+    case "$verdict" in
+        APPROVE*)         color="$GREEN" ;;
+        REQUEST_CHANGES*) color="$RED" ;;
+        COMMENT*)         color="$YELLOW" ;;
+    esac
+
+    printf "  ${color}%-17s${RESET}  %-14s  %-20s  %s\n" "$verdict" "${size:--}" "@${author:-?}" "${title:--}"
+}
+
+show_reviews_from_find() {
+    local label="$1"
+    shift
+    # Remaining args are passed to find
+    local count=0
+
+    echo "=== $label ==="
+    echo ""
+
+    while IFS= read -r file; do
+        [[ -z "$file" ]] && continue
+        format_review_line "$file"
+        count=$((count + 1))
+    done < <(find "$REVIEWS_DIR" "$@" 2>/dev/null | sort -r)
+
+    if (( count == 0 )); then
+        echo "  No reviews found."
+    else
+        echo ""
+        echo "  $count review(s)"
+    fi
+    echo ""
+    echo "  Run 'pr-reviews pr NUM' to read a full review."
+}
+
+case "${1:-new}" in
+    new)
+        if [[ -f "$LAST_CHECKED_FILE" ]]; then
+            show_reviews_from_find "New reviews since last check" -name 'review_*.md' -newer "$LAST_CHECKED_FILE"
+        else
+            show_reviews_from_find "Reviews from the last 24 hours" -name 'review_*.md' -mtime -1
+        fi
+        touch "$LAST_CHECKED_FILE"
+        ;;
+    all)
+        TODAY=$(date '+%Y%m%d')
+        show_reviews_from_find "All reviews from today" -name "review_${TODAY}_*.md"
+        ;;
+    pr)
+        PR_NUM="${2:-}"
+        if [[ -z "$PR_NUM" ]]; then
+            echo "Usage: pr-reviews pr <PR_NUMBER>"
+            exit 1
+        fi
+        LATEST=$(find "$REVIEWS_DIR" -path "*/$PR_NUM/review_*.md" 2>/dev/null | sort -r | head -1)
+        if [[ -z "$LATEST" ]]; then
+            echo "No review found for PR #$PR_NUM"
+            exit 1
+        fi
+        cat "$LATEST"
+        ;;
+    log)
+        tail -f "$LOG_FILE"
+        ;;
+    status)
+        echo "=== PR Reviewer Status ==="
+        echo ""
+        if launchctl list 2>/dev/null | grep -q pr-reviewer; then
+            PID=$(launchctl list | grep pr-reviewer | awk '{print $1}')
+            echo "  Job:      running (PID: $PID)"
+        else
+            echo "  Job:      not loaded"
+        fi
+        TOTAL=$(find "$REVIEWS_DIR" -name 'review_*.md' 2>/dev/null | wc -l | tr -d ' ')
+        ERRORS=$(find "$REVIEWS_DIR" -name 'error_*.txt' 2>/dev/null | wc -l | tr -d ' ')
+        TODAY_COUNT=$(find "$REVIEWS_DIR" -name "review_$(date '+%Y%m%d')_*.md" 2>/dev/null | wc -l | tr -d ' ')
+        LAST_RUN=$(grep 'PR review check finished' "$LOG_FILE" 2>/dev/null | tail -1 | grep -oE '\[.*\]' || echo "never")
+        echo "  Last run: $LAST_RUN"
+        echo "  Today:    $TODAY_COUNT reviews"
+        echo "  Total:    $TOTAL reviews, $ERRORS errors"
+        echo ""
+        STATE_COUNT=$(jq 'keys | length' "$HOME/.config/pr-reviewer/state.json" 2>/dev/null || echo "0")
+        echo "  Tracking: $STATE_COUNT PRs"
+        ;;
+    help|--help|-h)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
